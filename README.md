@@ -40,3 +40,6 @@ Commands:
 ```
 
 ![showcase.png](showcase.png)
+
+https://github.com/user-attachments/assets/62e919a7-89fe-469b-b2b4-595246c68c3c
+
