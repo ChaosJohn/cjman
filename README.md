@@ -38,3 +38,5 @@ Commands:
   install - install specified version, e.g., `cjman install 1.0.0`
   use     - activate specified version, e.g., `cjman use 1.0.0`
 ```
+
+![showcase.png](showcase.png)
