@@ -110,6 +110,12 @@ function use() {
   return -1
 }
 
+function update() {
+  echo "updating cjman..."
+  cd ${CJMAN_HOME}
+  git pull origin master
+}
+
 function usage() {
   echo "Usage: cjman [command]
 
@@ -120,6 +126,7 @@ Commands:
   list    - list all remote versions (prints "✔" if installed)
   install - install specified version, e.g., \`cjman install 1.0.0\`
   use     - activate specified version, e.g., \`cjman use 1.0.0\`
+  update  - update cjman to latest version
 "
 }
 
@@ -137,7 +144,13 @@ function cjman() {
 
   if [[ "$1" == "use" ]]; then
     shift
-    use "$@"
+    use
+    return $?
+  fi
+
+  if [[ "$1" == "update" ]]; then
+    shift
+    update
     return $?
   fi
 

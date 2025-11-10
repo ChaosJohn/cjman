@@ -32,6 +32,7 @@ Commands:
   list    - list all remote versions (prints ✔ if installed)
   install - install specified version, e.g., `cjman install 1.0.0`
   use     - activate specified version, e.g., `cjman use 1.0.0`
+  update  - update cjman to latest version
 ```
 
 ![showcase.png](showcase.png)
