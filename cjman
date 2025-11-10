@@ -1,6 +1,6 @@
-export CJVM_HOME="${HOME}/.cjvm"
-export CANGJIE_BUNDLES="${CJVM_HOME}/bundles"
-source "${CJVM_HOME}/common"
+export CJMAN_HOME="${HOME}/.cjman"
+export CANGJIE_BUNDLES="${CJMAN_HOME}/bundles"
+source "${CJMAN_HOME}/common"
 
 function list() {
   versions=$(curl -sL ${VERSIONS_URL})
@@ -11,14 +11,14 @@ function list() {
     if [[ -d "${RELEASE}" && -f "${RELEASE}/envsetup.sh" ]]; then
       installed="✔"
     fi
-    echo "${version} \t-> ${name} ${installed}"
+    printf "%-10s -> %s %s\n" "${version}" "${name}" "${installed}"
   done
 }
 
 function __use_tip() {
   version=$1
   echo "cangjie ${version} installed, try it by:"
-  echo " \`cjvm use ${version}\`"
+  echo " \`cjman use ${version}\`"
 }
 
 function install() {
@@ -111,19 +111,19 @@ function use() {
 }
 
 function usage() {
-  echo "Usage: cjvm [command]
+  echo "Usage: cjman [command]
 
 Description: 
-  A Version Manager for Cangjie Language
+  A SDK Manager for Cangjie Language
 
 Commands:
   list    - list all remote versions (prints "✔" if installed)
-  install - install specified version, e.g., \`cjvm install 0.53.13\`
-  use     - activate specified version, e.g., \`cjvm use 0.53.13\`
+  install - install specified version, e.g., \`cjman install 1.0.0\`
+  use     - activate specified version, e.g., \`cjman use 1.0.0\`
 "
 }
 
-function cjvm() {
+function cjman() {
   if [[ "$1" == "list" ]]; then
     list
     return $?
