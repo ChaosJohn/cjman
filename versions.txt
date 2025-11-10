@@ -3,3 +3,4 @@
 1.0.0,Cangjie 1.0.0 LTS
 1.0.1,Cangjie 1.0.1 LTS
 1.0.3,Cangjie 1.0.3 LTS
+1.0.4,Cangjie 1.0.4 LTS
