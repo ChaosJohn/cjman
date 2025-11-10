@@ -17,13 +17,8 @@ Inspired by:
 # Installing
 To install:
 ```bash
-bash < <(curl -s -S -L https://raw.githubusercontent.com/ChaosJohn/cjman/master/cjman-installer)
+bash < <(curl -s -S -L https://raw.gitcode.com/ChaosJohn/cjman/raw/master/cjman-installer)
 ```
-> If you encounter network problem when accessing Github, switch to Gitcode instead. 
-> ```bash
-> export GIT_PROVIDER=gitcode.com;
-> bash < <(curl -s -S -L https://raw.gitcode.com/ChaosJohn/cjman/raw/master/cjman-installer)
-> ```
 
 # Usage
 ```bash
@@ -40,6 +35,4 @@ Commands:
 ```
 
 ![showcase.png](showcase.png)
-
-https://github.com/user-attachments/assets/62e919a7-89fe-469b-b2b4-595246c68c3c
 

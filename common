@@ -1,8 +1,8 @@
 # export CJMAN_HOME="${HOME}/.cjman"
 
-export BASE_URL="https://raw.githubusercontent.com/ChaosJohn/cjman/master"
-if grep -qF "gitcode.com" "${CJMAN_HOME}/.git/config"; then
-  export BASE_URL="https://raw.gitcode.com/ChaosJohn/cjman/raw/master"
+export BASE_URL="https://raw.gitcode.com/ChaosJohn/cjman/raw/master"
+if grep -qF "github.com" "${CJMAN_HOME}/.git/config"; then
+  export BASE_URL="https://raw.githubusercontent.com/ChaosJohn/cjman/master"
 fi
 
 export VERSIONS_URL="${BASE_URL}/versions.txt"
