@@ -143,12 +143,11 @@ function cjman() {
 
   if [[ "$1" == "use" ]]; then
     shift
-    use
+    use "$@"
     return $?
   fi
 
   if [[ "$1" == "update" ]]; then
-    shift
     update
     return $?
   fi
