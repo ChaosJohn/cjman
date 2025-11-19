@@ -113,6 +113,7 @@ function update() {
   echo "updating cjman..."
   cd ${CJMAN_HOME}
   git pull origin master
+  cd -
 }
 
 function usage() {
