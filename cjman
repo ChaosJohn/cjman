@@ -4,8 +4,7 @@ source "${CJMAN_HOME}/common"
 
 function list() {
   versions=$(curl -sL ${VERSIONS_URL})
-  # echo ${versions} | awk -F ',' 'BEGIN{OFS=" \t-> "}{print $1, $2}'
-  echo ${versions} | awk -F ',' '{print $1, $2}' | while read version name; do
+  echo "${versions}" | awk -F ',' '{print $1, $2}' | while read version name; do
     RELEASE="${CANGJIE_BUNDLES}/cangjie-${version}"
     installed=""
     if [[ -d "${RELEASE}" && -f "${RELEASE}/envsetup.sh" ]]; then
@@ -27,7 +26,7 @@ function install() {
 
   os_type=$(uname -s)
   os_arch=$(uname -m)
-  
+
   if [[ "${os_type}" == "Linux" ]]; then
     os="linux"
   elif [[ "${os_type}" == "Darwin" ]]; then
@@ -36,12 +35,12 @@ function install() {
     error "unsupported os: ${os_type}"
     return -1
   fi
-  
+
   if [[ "${os_arch}" == "x86_64" ]]; then
     arch="x64"
   elif [[ "${os_arch}" == "aarch64" || "${os_arch}" == "arm64" ]]; then
     arch="aarch64"
-  else 
+  else
     error "unsupported arch: ${os_arch}"
     return -1
   fi
@@ -51,9 +50,9 @@ function install() {
     error "failed to find version ${version}"
     return -1
   fi
-  
-  nsId=$(echo $release | grep -F "nsId") 
-  line=$(echo $release | grep -E "${os}" | grep -F "${arch}")
+
+  nsId=$(echo "$release" | grep -F "nsId")
+  line=$(echo "$release" | grep -E "${os}" | grep -F "${arch}")
   if [[ -z "${line}" ]]; then
     error "no release found for ${os_type} ${os_arch} in version ${version}"
     return -1
@@ -62,15 +61,15 @@ function install() {
   URL="https://cangjie-lang.cn/v1/files/auth/downLoad?${nsId}&fileName=${tarball}&objectKey=${objectKey}"
 
   mkdir -p "${CANGJIE_BUNDLES}"
-  RELEASE="${CANGJIE_BUNDLES}/cangjie-${version}"  
-  
+  RELEASE="${CANGJIE_BUNDLES}/cangjie-${version}"
+
   if [[ -f "${CANGJIE_BUNDLES}/${tarball}" && -d "${RELEASE}" && -f "${RELEASE}/envsetup.sh" ]]; then
     __use_tip "${version}"
     return 0
   fi
-  
-  curl -L "${URL}" -o "${CANGJIE_BUNDLES}/${tarball}" -C - 
-  if [[ ! $? -eq 0 ]]; then 
+
+  curl -L "${URL}" -o "${CANGJIE_BUNDLES}/${tarball}" -C -
+  if [[ ! $? -eq 0 ]]; then
     error "failed to download ${tarball}. cleaning up..."
     rm -rf "${CANGJIE_BUNDLES}/${tarball}"
     return -1
@@ -85,9 +84,9 @@ function install() {
   #     return -1
   #   fi
   # fi
-  
+
   echo "${tarball} downloaded, extracting..."
-  tar xzf "${CANGJIE_BUNDLES}/${tarball}" -C "${CANGJIE_BUNDLES}" 
+  tar xzf "${CANGJIE_BUNDLES}/${tarball}" -C "${CANGJIE_BUNDLES}"
   if [[ ! $? -eq 0 ]]; then
     error "${tarball} is corrupted"
     return -1
@@ -119,7 +118,7 @@ function update() {
 function usage() {
   echo "Usage: cjman [command]
 
-Description: 
+Description:
   A SDK Manager for Cangjie Language
 
 Commands:
