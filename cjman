@@ -1,158 +1,1508 @@
-export CJMAN_HOME="${HOME}/.cjman"
-export CANGJIE_BUNDLES="${CJMAN_HOME}/bundles"
+export CJMAN_HOME="${CJMAN_HOME:-${HOME}/.cjman}"
+export CANGJIE_BUNDLES="${CANGJIE_BUNDLES:-${CJMAN_HOME}/bundles}"
+
+if [[ ! -f "${CJMAN_HOME}/common" ]]; then
+  printf 'ERR: cjman common file not found: %s\n' "${CJMAN_HOME}/common" >&2
+  return 1 2>/dev/null || exit 1
+fi
 source "${CJMAN_HOME}/common"
 
-function list() {
-  versions=$(curl -sL ${VERSIONS_URL})
-  echo "${versions}" | awk -F ',' '{print $1, $2}' | while read version name; do
-    RELEASE="${CANGJIE_BUNDLES}/cangjie-${version}"
-    installed=""
-    if [[ -d "${RELEASE}" && -f "${RELEASE}/envsetup.sh" ]]; then
-      installed="✔"
-    fi
-    printf "%-10s -> %s %s\n" "${version}" "${name}" "${installed}"
+function __cjman_fetch_url() {
+  local url="$1"
+  command -v curl >/dev/null 2>&1 || {
+    __cjman_error "curl is required"
+    return 1
+  }
+  curl --fail --location --silent --show-error --retry 2 --connect-timeout 15 "${url}"
+}
+
+function __cjman_fetch_catalog() {
+  if [[ -n "${CJMAN_METADATA_DIR:-}" ]]; then
+    command cat "${CJMAN_METADATA_DIR}/catalog.tsv"
+  elif [[ -f "${CJMAN_HOME}/metadata/v2/catalog.tsv" ]]; then
+    command cat "${CJMAN_HOME}/metadata/v2/catalog.tsv"
+  else
+    __cjman_fetch_url "${CJMAN_METADATA_BASE}/catalog.tsv"
+  fi
+}
+
+function __cjman_fetch_manifest() {
+  local version="$1"
+  case "${version}" in
+    *[!A-Za-z0-9._-]*|'')
+      __cjman_error "invalid version: ${version}"
+      return 1
+      ;;
+  esac
+  if [[ -n "${CJMAN_METADATA_DIR:-}" ]]; then
+    command cat "${CJMAN_METADATA_DIR}/releases/${version}.tsv"
+  elif [[ -f "${CJMAN_HOME}/metadata/v2/releases/${version}.tsv" ]]; then
+    command cat "${CJMAN_HOME}/metadata/v2/releases/${version}.tsv"
+  else
+    __cjman_fetch_url "${CJMAN_METADATA_BASE}/releases/${version}.tsv"
+  fi
+}
+
+function __cjman_normalize_os() {
+  local value="${1:-}"
+  case "${value}" in
+    Linux*|linux) printf '%s\n' "linux" ;;
+    Darwin*|darwin|mac|macos) printf '%s\n' "mac" ;;
+    MINGW*|MSYS*|CYGWIN*|Windows*|windows) printf '%s\n' "windows" ;;
+    OHOS*|OpenHarmony*|ohos) printf '%s\n' "ohos" ;;
+    *)
+      __cjman_error "unsupported os: ${value}"
+      return 1
+      ;;
+  esac
+}
+
+function __cjman_normalize_arch() {
+  local value="${1:-}"
+  case "${value}" in
+    x86_64|amd64|AMD64|x64|X64) printf '%s\n' "x64" ;;
+    aarch64|arm64|ARM64) printf '%s\n' "aarch64" ;;
+    armv7l|armv7|arm32|ARM) printf '%s\n' "arm32" ;;
+    *)
+      __cjman_error "unsupported arch: ${value}"
+      return 1
+      ;;
+  esac
+}
+
+function __cjman_host_os() {
+  if [[ -n "${CJMAN_HOST_OS:-}" ]]; then
+    __cjman_normalize_os "${CJMAN_HOST_OS}"
+  else
+    __cjman_normalize_os "$(uname -s)"
+  fi
+}
+
+function __cjman_host_arch() {
+  if [[ -n "${CJMAN_HOST_ARCH:-}" ]]; then
+    __cjman_normalize_arch "${CJMAN_HOST_ARCH}"
+  else
+    __cjman_normalize_arch "$(uname -m)"
+  fi
+}
+
+function __cjman_stable_exists() {
+  local requested="$1"
+  local catalog
+  catalog="$(__cjman_fetch_catalog)" || return 1
+  printf '%s\n' "${catalog}" |
+    awk -F '\t' -v requested="${requested}" '
+      NR > 1 && $1 == requested { found = 1 }
+      END { exit(found ? 0 : 1) }
+    '
+}
+
+function __cjman_resolve_stable_alias() {
+  local requested="$1"
+  local catalog
+  local channel=""
+  catalog="$(__cjman_fetch_catalog)" || return 1
+
+  case "${requested}" in
+    latest) channel="latest" ;;
+    lts|LTS) channel="lts" ;;
+    sts|STS) channel="sts" ;;
+    *)
+      if __cjman_stable_exists "${requested}"; then
+        printf '%s\n' "${requested}"
+        return 0
+      fi
+      return 1
+      ;;
+  esac
+
+  printf '%s\n' "${catalog}" |
+    awk -F '\t' -v channel="${channel}" '
+      NR == 1 || $1 ~ /^#/ { next }
+      channel == "latest" { version = $1; next }
+      tolower($2) == channel { version = $1 }
+      END {
+        if (version == "") exit 1
+        print version
+      }
+    '
+}
+
+function __cjman_extract_tag_from_json() {
+  tr -d '\n' |
+    grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' |
+    head -1 |
+    sed -E 's/^"tag_name"[[:space:]]*:[[:space:]]*"([^"]*)"$/\1/'
+}
+
+function __cjman_extract_assets_from_json() {
+  local object name url
+  tr '\r\n' '  ' |
+    sed -E 's/}[[:space:]]*,[[:space:]]*\{/}\
+{/g' |
+    while IFS= read -r object || [[ -n "${object}" ]]; do
+      printf '%s' "${object}" |
+        grep -Eq '"type"[[:space:]]*:[[:space:]]*"attach"' || continue
+      printf '%s' "${object}" |
+        grep -Eq '"name"[[:space:]]*:[[:space:]]*"[^"]*"' || continue
+      printf '%s' "${object}" |
+        grep -Eq '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' || continue
+      name="$(printf '%s' "${object}" |
+        sed -E 's/^.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*$/\1/')"
+      url="$(printf '%s' "${object}" |
+        sed -E 's/^.*"browser_download_url"[[:space:]]*:[[:space:]]*"([^"]*)".*$/\1/' |
+        sed 's#\\/#/#g')"
+      printf '%s\t%s\n' "${name}" "${url}"
+    done
+}
+
+function __cjman_nightly_release_json() {
+  local requested="$1"
+  local url
+  if [[ "${requested}" == "nightly" ]]; then
+    url="${CJMAN_NIGHTLY_API}/latest"
+  else
+    case "${requested}" in
+      *[!A-Za-z0-9._-]*|'')
+        __cjman_error "invalid nightly tag: ${requested}"
+        return 1
+        ;;
+    esac
+    url="${CJMAN_NIGHTLY_API}/tags/${requested}"
+  fi
+  __cjman_fetch_url "${url}"
+}
+
+function __cjman_nightly_assets() {
+  local tag="$1"
+  local json="$2"
+  local name ignored_url
+  printf '%s' "${json}" |
+    __cjman_extract_assets_from_json |
+    while IFS=$'\t' read -r name ignored_url; do
+      [[ -n "${name}" ]] || continue
+      printf '%s\t%s\n' "${name}" \
+        "https://gitcode.com/Cangjie/nightly_build/releases/download/${tag}/${name}"
+    done
+}
+
+function __cjman_select_stable_sdk() {
+  local manifest="$1"
+  local host_os="$2"
+  local host_arch="$3"
+  local target_os="$4"
+  local target_arch="$5"
+  local flavor="${6:-default}"
+
+  printf '%s\n' "${manifest}" |
+    awk -F '\t' \
+      -v host_os="${host_os}" \
+      -v host_arch="${host_arch}" \
+      -v target_os="${target_os}" \
+      -v target_arch="${target_arch}" \
+      -v flavor="${flavor}" '
+      NR == 1 || $1 ~ /^#/ { next }
+      $1 != "sdk" || $2 != host_os || $3 != host_arch ||
+      $4 != target_os || ($5 != target_arch && $5 != "any") ||
+      $6 != flavor || $7 == "exe" { next }
+      {
+        score = ($5 == target_arch ? 20 : 10)
+        if (host_os == "windows" && $7 == "zip") score += 5
+        if (host_os != "windows" && $7 == "tar.gz") score += 5
+        if (score > best) {
+          best = score
+          selected = $0
+        }
+      }
+      END {
+        if (selected == "") exit 1
+        print selected
+      }
+    '
+}
+
+function __cjman_pick_stdx_asset() {
+  local sdk_version="$1"
+  local stdx_target="$2"
+  local prefix="cangjie-stdx-${stdx_target}-${sdk_version}."
+  local name url suffix patch
+  local best_patch=-1
+  local best_line=""
+
+  while IFS=$'\t' read -r name url; do
+    case "${name}" in
+      "${prefix}"*.zip)
+        suffix="${name#${prefix}}"
+        patch="${suffix%.zip}"
+        case "${patch}" in
+          ''|*[!0-9]*) continue ;;
+        esac
+        if [[ "${patch}" -gt "${best_patch}" ]]; then
+          best_patch="${patch}"
+          best_line="${name}"$'\t'"${url}"
+        fi
+        ;;
+    esac
+  done
+
+  [[ -n "${best_line}" ]] || return 1
+  printf '%s\n' "${best_line}"
+}
+
+function __cjman_collect_stdx_assets() {
+  local page=1
+  local body assets
+  while [[ "${page}" -le 50 ]]; do
+    body="$(__cjman_fetch_url "${CJMAN_STDX_API}?per_page=100&page=${page}")" || return 1
+    [[ "${body}" != "[]" ]] || break
+    assets="$(printf '%s' "${body}" | __cjman_extract_assets_from_json || true)"
+    [[ -n "${assets}" ]] && printf '%s\n' "${assets}"
+    page=$((page + 1))
   done
 }
 
-function __use_tip() {
-  version=$1
-  echo "cangjie ${version} installed, try it by:"
-  echo " \`cjman use ${version}\`"
+function __cjman_find_stdx_asset() {
+  local sdk_version="$1"
+  local stdx_target="$2"
+  __cjman_collect_stdx_assets |
+    __cjman_pick_stdx_asset "${sdk_version}" "${stdx_target}"
 }
 
-function install() {
-  version=$1
-  VERSION_URL="${BASE_URL}/versions/$version"
+function __cjman_pick_nightly_sdk() {
+  local host_os="$1"
+  local host_arch="$2"
+  local target_os="$3"
+  local target_arch="$4"
+  local prefix="cangjie-sdk-${host_os}-${host_arch}-"
+  local sdk_target="${target_os}"
+  local name url rest base format format_score score
+  local best_score=-1
+  local best_line=""
 
-  os_type=$(uname -s)
-  os_arch=$(uname -m)
+  [[ "${sdk_target}" == "ios-simulator" ]] && sdk_target="ios"
 
-  if [[ "${os_type}" == "Linux" ]]; then
-    os="linux"
-  elif [[ "${os_type}" == "Darwin" ]]; then
-    os="darwin|mac"
+  while IFS=$'\t' read -r name url; do
+    case "${name}" in
+      "${prefix}"*) rest="${name#${prefix}}" ;;
+      *) continue ;;
+    esac
+
+    if [[ "${host_os}" == "windows" ]]; then
+      case "${name}" in
+        *.zip) format="zip"; format_score=2; base="${rest%.zip}" ;;
+        *.exe) format="exe"; format_score=1; base="${rest%.exe}" ;;
+        *) continue ;;
+      esac
+    else
+      case "${name}" in *.tar.gz) format="tar.gz"; format_score=2 ;; *) continue ;; esac
+      base="${rest%.tar.gz}"
+    fi
+
+    score=-1
+    if [[ "${target_os}" == "native" ]]; then
+      [[ "${target_arch}" == "${host_arch}" ]] || continue
+      case "${base}" in
+        [0-9]*)
+          case "${base}" in *-sanitizer) continue ;; esac
+          score=10
+          ;;
+      esac
+    else
+      case "${base}" in
+        "${sdk_target}-${target_arch}-"[0-9]*) score=30 ;;
+        "${sdk_target}-"[0-9]*) score=20 ;;
+      esac
+    fi
+    [[ "${score}" -lt 0 ]] || score=$((score + format_score))
+
+    if [[ "${score}" -gt "${best_score}" ]]; then
+      best_score="${score}"
+      best_line="${name}"$'\t'"${url}"$'\t'"${format}"
+    fi
+  done
+
+  [[ -n "${best_line}" ]] || return 1
+  printf '%s\n' "${best_line}"
+}
+
+function __cjman_pick_nightly_frontend() {
+  local host_os="$1"
+  local host_arch="$2"
+  local expected_version="$3"
+  local prefix="cangjie-frontend-${host_os}-${host_arch}-"
+  local name url format base component_version
+  while IFS=$'\t' read -r name url; do
+    case "${host_os}:${name}" in
+      windows:"${prefix}"*.zip) format="zip"; base="${name%.zip}" ;;
+      *:"${prefix}"*.tar.gz) format="tar.gz"; base="${name%.tar.gz}" ;;
+      *) continue ;;
+    esac
+    component_version="${base#${prefix}}"
+    [[ "${component_version}" == "${expected_version}" ]] || continue
+    printf '%s\t%s\t%s\n' "${name}" "${url}" "${format}"
+    return 0
+  done
+  return 1
+}
+
+function __cjman_pick_nightly_stdx() {
+  local stdx_target="$1"
+  local expected_version="$2"
+  local prefix="cangjie-stdx-${stdx_target}-${expected_version}."
+  local name url suffix patch
+  local best_patch=-1
+  local selected=""
+  while IFS=$'\t' read -r name url; do
+    case "${name}" in
+      "${prefix}"*.zip)
+        suffix="${name#${prefix}}"
+        patch="${suffix%.zip}"
+        case "${patch}" in
+          ''|*[!0-9]*) continue ;;
+        esac
+        if [[ "${patch}" -gt "${best_patch}" ]]; then
+          best_patch="${patch}"
+          selected="${name}"$'\t'"${url}"
+        fi
+        ;;
+    esac
+  done
+  [[ -n "${selected}" ]] || return 1
+  printf '%s\n' "${selected}"
+}
+
+function __cjman_nightly_sdk_version() {
+  local filename="$1"
+  local host_os="$2"
+  local host_arch="$3"
+  local target_os="$4"
+  local target_arch="$5"
+  local prefix="cangjie-sdk-${host_os}-${host_arch}-"
+  local sdk_target="${target_os}"
+  local rest version
+
+  case "${host_os}:${filename}" in
+    windows:"${prefix}"*.zip) rest="${filename#${prefix}}"; rest="${rest%.zip}" ;;
+    windows:"${prefix}"*.exe) rest="${filename#${prefix}}"; rest="${rest%.exe}" ;;
+    *:"${prefix}"*.tar.gz) rest="${filename#${prefix}}"; rest="${rest%.tar.gz}" ;;
+    *) return 1 ;;
+  esac
+
+  if [[ "${target_os}" == "native" ]]; then
+    version="${rest}"
   else
-    error "unsupported os: ${os_type}"
-    return -1
+    [[ "${sdk_target}" == "ios-simulator" ]] && sdk_target="ios"
+    case "${rest}" in
+      "${sdk_target}-${target_arch}-"*)
+        version="${rest#${sdk_target}-${target_arch}-}"
+        ;;
+      "${sdk_target}-"*)
+        version="${rest#${sdk_target}-}"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
   fi
 
-  if [[ "${os_arch}" == "x86_64" ]]; then
-    arch="x64"
-  elif [[ "${os_arch}" == "aarch64" || "${os_arch}" == "arm64" ]]; then
-    arch="aarch64"
-  else
-    error "unsupported arch: ${os_arch}"
-    return -1
-  fi
+  [[ -n "${version}" ]] || return 1
+  printf '%s\n' "${version}"
+}
 
-  release=$(curl -sL "${VERSION_URL}")
-  if [[ ! $? -eq 0 ]]; then
-    error "failed to find version ${version}"
-    return -1
-  fi
+function __cjman_install_dir() {
+  local version="$1"
+  local host_os="$2"
+  local host_arch="$3"
+  local target_os="$4"
+  local target_arch="$5"
+  printf '%s\n' \
+    "${CANGJIE_BUNDLES}/cangjie-${version}-${host_os}-${host_arch}-${target_os}-${target_arch}"
+}
 
-  nsId=$(echo "$release" | grep -F "nsId")
-  line=$(echo "$release" | grep -E "${os}" | grep -F "${arch}")
-  if [[ -z "${line}" ]]; then
-    error "no release found for ${os_type} ${os_arch} in version ${version}"
-    return -1
-  fi
-  IFS="," read -r tarball objectKey sha256 size <<< "${line}"
-  URL="https://cangjie-lang.cn/v1/files/auth/downLoad?${nsId}&fileName=${tarball}&objectKey=${objectKey}"
+function __cjman_resolve_install_dir() {
+  local version="$1"
+  local host_os="$2"
+  local host_arch="$3"
+  local target_os="$4"
+  local target_arch="$5"
+  local quiet="${6:-0}"
+  local allow_legacy="${7:-1}"
+  local primary legacy
 
-  mkdir -p "${CANGJIE_BUNDLES}"
-  RELEASE="${CANGJIE_BUNDLES}/cangjie-${version}"
-
-  if [[ -f "${CANGJIE_BUNDLES}/${tarball}" && -d "${RELEASE}" && -f "${RELEASE}/envsetup.sh" ]]; then
-    __use_tip "${version}"
+  primary="$(__cjman_install_dir \
+    "${version}" "${host_os}" "${host_arch}" "${target_os}" "${target_arch}")"
+  if [[ -e "${primary}" || "${target_os}" != "native" ||
+      "${allow_legacy}" != "1" ]]; then
+    printf '%s\n' "${primary}"
     return 0
   fi
 
-  curl -L "${URL}" -o "${CANGJIE_BUNDLES}/${tarball}" -C -
-  if [[ ! $? -eq 0 ]]; then
-    error "failed to download ${tarball}. cleaning up..."
-    rm -rf "${CANGJIE_BUNDLES}/${tarball}"
-    return -1
-  fi
-
-  # which sha256sum
-  # if [[ $? -eq 0 ]]; then
-  #   checksum=$(sha256sum "${CANGJIE_BUNDLES}/${tarball}" | awk '{print $1}')
-  #   if [[ ! $sha256 =~ ^$checksum$ ]]; then
-  #     rm -rf "${CANGJIE_BUNDLES}/${tarball}"
-  #     error "checksum dismatch, abort"
-  #     return -1
-  #   fi
-  # fi
-
-  echo "${tarball} downloaded, extracting..."
-  tar xzf "${CANGJIE_BUNDLES}/${tarball}" -C "${CANGJIE_BUNDLES}"
-  if [[ ! $? -eq 0 ]]; then
-    error "${tarball} is corrupted"
-    return -1
-  fi
-  mv "${CANGJIE_BUNDLES}/cangjie" "${RELEASE}"
-
-  __use_tip "${version}"
-  return 0
-}
-
-function use() {
-  version=$1
-  RELEASE="${CANGJIE_BUNDLES}/cangjie-${version}"
-  if [[ -d "${RELEASE}" && -f "${RELEASE}/envsetup.sh" ]]; then
-    source "${RELEASE}/envsetup.sh"
-    echo "cangjie ${version} activated. "
+  legacy="${CANGJIE_BUNDLES}/cangjie-${version}"
+  if [[ -f "${legacy}/envsetup.sh" ]]; then
+    [[ "${quiet}" == "1" ]] ||
+      __cjman_warn "using legacy native SDK directory: ${legacy}"
+    printf '%s\n' "${legacy}"
     return 0
   fi
-  error "cangjie ${version} not installed"
-  return -1
+
+  printf '%s\n' "${primary}"
 }
 
-function update() {
-  echo "updating cjman..."
-  cd ${CJMAN_HOME}
-  git pull origin master
-  cd -
+function __cjman_nightly_marker() {
+  local host_os="$1"
+  local host_arch="$2"
+  local target_os="$3"
+  local target_arch="$4"
+  printf '%s\n' \
+    "${CANGJIE_BUNDLES}/.nightly-current-${host_os}-${host_arch}-${target_os}-${target_arch}"
 }
 
-function usage() {
-  echo "Usage: cjman [command]
+function __cjman_stdx_target() {
+  local host_os="$1"
+  local host_arch="$2"
+  local target_os="$3"
+  local target_arch="$4"
+  if [[ "${target_os}" == "native" ]]; then
+    printf '%s\n' "${host_os}-${host_arch}"
+  else
+    printf '%s\n' "${target_os}-${target_arch}"
+  fi
+}
 
-Description:
-  A SDK Manager for Cangjie Language
+function __cjman_safe_filename() {
+  local filename="$1"
+  case "${filename}" in
+    ''|.|..|*/*|*\\*)
+      __cjman_error "unsafe asset filename: ${filename}"
+      return 1
+      ;;
+  esac
+}
 
-Commands:
-  list    - list all remote versions (prints "✔" if installed)
-  install - install specified version, e.g., \`cjman install 1.0.0\`
-  use     - activate specified version, e.g., \`cjman use 1.0.0\`
-  update  - update cjman to latest version
-"
+function __cjman_acquire_lock() {
+  local lock="$1"
+  local owner=""
+  if command mkdir "${lock}" 2>/dev/null; then
+    printf '%s\n' "$$" > "${lock}/pid" || {
+      command rmdir "${lock}" 2>/dev/null || true
+      return 1
+    }
+    return 0
+  fi
+
+  if [[ -f "${lock}/pid" ]]; then
+    owner="$(command cat "${lock}/pid" 2>/dev/null || true)"
+    case "${owner}" in
+      ''|*[!0-9]*) ;;
+      *)
+        if kill -0 "${owner}" 2>/dev/null; then
+          return 1
+        fi
+        ;;
+    esac
+    command rm -f "${lock}/pid" 2>/dev/null || return 1
+  fi
+  command rmdir "${lock}" 2>/dev/null || return 1
+  __cjman_warn "removed stale install lock: ${lock}"
+  command mkdir "${lock}" 2>/dev/null || return 1
+  printf '%s\n' "$$" > "${lock}/pid" || {
+    command rmdir "${lock}" 2>/dev/null || true
+    return 1
+  }
+}
+
+function __cjman_release_lock() {
+  local lock="$1"
+  local owner=""
+  [[ -d "${lock}" ]] || return 0
+  owner="$(command cat "${lock}/pid" 2>/dev/null || true)"
+  if [[ -z "${owner}" || "${owner}" == "$$" ]]; then
+    command rm -f "${lock}/pid" 2>/dev/null || true
+    command rmdir "${lock}" 2>/dev/null || true
+  fi
+}
+
+function __cjman_sha256() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${file}" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${file}" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "${file}" | awk '{print $NF}'
+  else
+    __cjman_error "sha256sum, shasum, or openssl is required"
+    return 1
+  fi
+}
+
+function __cjman_7zip_command() {
+  local candidate resolved
+  for candidate in 7z 7za 7zz; do
+    resolved="$(command -v "${candidate}" 2>/dev/null || true)"
+    if [[ -n "${resolved}" ]]; then
+      printf '%s\n' "${resolved}"
+      return 0
+    fi
+  done
+
+  for candidate in \
+      "/c/Program Files/7-Zip/7z.exe" \
+      "/c/Program Files (x86)/7-Zip/7z.exe"; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  __cjman_error "7-Zip is required to unpack this EXE-only Windows Nightly SDK"
+  return 1
+}
+
+function __cjman_verify_checksum() {
+  local file="$1"
+  local expected="$2"
+  local actual
+  [[ -n "${expected}" && "${expected}" != "-" ]] || return 0
+  actual="$(__cjman_sha256 "${file}")" || return 1
+  actual="$(printf '%s' "${actual}" | tr '[:upper:]' '[:lower:]')"
+  expected="$(printf '%s' "${expected}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${actual}" != "${expected}" ]]; then
+    __cjman_error "checksum mismatch for $(basename "${file}")"
+    return 1
+  fi
+}
+
+function __cjman_verify_unchecksummed_archive() {
+  local file="$1"
+  local filename="$2"
+  case "${filename}" in
+    *.tar.gz)
+      tar -tzf "${file}" >/dev/null 2>&1
+      ;;
+    *.zip)
+      command -v unzip >/dev/null 2>&1 &&
+        unzip -tq "${file}" >/dev/null 2>&1
+      ;;
+    *.exe)
+      local seven_zip
+      seven_zip="$(__cjman_7zip_command)" || return 1
+      "${seven_zip}" t -y -- "${file}" >/dev/null 2>&1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+function __cjman_download() {
+  local url="$1"
+  local filename="$2"
+  local expected_sha="$3"
+  local downloads="${CANGJIE_BUNDLES}/downloads"
+  local destination="${downloads}/${filename}"
+  local partial="${destination}.part.$$"
+
+  command -v curl >/dev/null 2>&1 || {
+    __cjman_error "curl is required"
+    return 1
+  }
+  __cjman_safe_filename "${filename}" || return 1
+  command mkdir -p "${downloads}" || return 1
+
+  if [[ -f "${destination}" ]]; then
+    if __cjman_verify_checksum "${destination}" "${expected_sha}" &&
+        { [[ -n "${expected_sha}" && "${expected_sha}" != "-" ]] ||
+          __cjman_verify_unchecksummed_archive "${destination}" "${filename}"; }; then
+      printf '%s\n' "${destination}"
+      return 0
+    fi
+    __cjman_warn "discarding invalid cached asset: ${filename}"
+    command rm -f "${destination}"
+  fi
+
+  __cjman_log "downloading ${filename}"
+  if ! curl --fail --location --show-error --retry 2 --connect-timeout 15 \
+      --output "${partial}" "${url}"; then
+    command rm -f "${partial}"
+    __cjman_error "failed to download ${filename}"
+    return 1
+  fi
+  if ! __cjman_verify_checksum "${partial}" "${expected_sha}"; then
+    command rm -f "${partial}"
+    return 1
+  fi
+  command mv "${partial}" "${destination}" || {
+    command rm -f "${partial}"
+    return 1
+  }
+  printf '%s\n' "${destination}"
+}
+
+function __cjman_validate_archive_entries() {
+  local archive="$1"
+  local format="$2"
+  local list_file="$3"
+  local entry normalized seven_zip
+
+  case "${format}" in
+    tar.gz)
+      tar -tzf "${archive}" > "${list_file}" || return 1
+      ;;
+    zip)
+      command -v unzip >/dev/null 2>&1 || {
+        __cjman_error "unzip is required for zip SDKs"
+        return 1
+      }
+      unzip -Z1 "${archive}" > "${list_file}" || return 1
+      ;;
+    exe)
+      seven_zip="$(__cjman_7zip_command)" || return 1
+      "${seven_zip}" l -slt -- "${archive}" |
+        awk '
+          /^----------$/ { entries = 1; next }
+          entries && /^Path = / {
+            sub(/^Path = /, "")
+            print
+          }
+        ' > "${list_file}" || return 1
+      [[ -s "${list_file}" ]] || return 1
+      ;;
+    *)
+      __cjman_error "unsupported archive format: ${format}"
+      return 1
+      ;;
+  esac
+
+  while IFS= read -r entry; do
+    normalized="$(printf '%s' "${entry}" | tr '\\' '/')"
+    case "${normalized}" in
+      /*|//*|[A-Za-z]:*|*:*|../*|*/../*|*/..)
+        __cjman_error "unsafe archive entry: ${entry}"
+        return 1
+        ;;
+    esac
+  done < "${list_file}"
+}
+
+function __cjman_extract_archive() {
+  local archive="$1"
+  local format="$2"
+  local destination="$3"
+  local list_file="$4"
+  local seven_zip
+  __cjman_validate_archive_entries "${archive}" "${format}" "${list_file}" || return 1
+  case "${format}" in
+    tar.gz) tar -xzf "${archive}" -C "${destination}" ;;
+    zip) unzip -q -o "${archive}" -d "${destination}" ;;
+    exe)
+      seven_zip="$(__cjman_7zip_command)" || return 1
+      "${seven_zip}" x -y "-o${destination}" \
+        '-x!$PLUGINSDIR/*' '-x!uninstall.exe' -- "${archive}" >/dev/null
+      ;;
+  esac
+}
+
+function __cjman_find_envsetup() {
+  local root="$1"
+  find "${root}" -type f -name envsetup.sh 2>/dev/null | head -1
+}
+
+function __cjman_stdx_version_from_name() {
+  local name="$1"
+  local target="$2"
+  local prefix="cangjie-stdx-${target}-"
+  local version="${name#${prefix}}"
+  printf '%s\n' "${version%.zip}"
+}
+
+function __cjman_write_marker() {
+  local release="$1"
+  local version="$2"
+  local channel="$3"
+  local host_os="$4"
+  local host_arch="$5"
+  local target_os="$6"
+  local target_arch="$7"
+  local sdk_filename="$8"
+  local frontend_filename="$9"
+  local stdx_version="${10}"
+  local stdx_target="${11}"
+  {
+    printf 'version\t%s\n' "${version}"
+    printf 'channel\t%s\n' "${channel}"
+    printf 'host_os\t%s\n' "${host_os}"
+    printf 'host_arch\t%s\n' "${host_arch}"
+    printf 'target_os\t%s\n' "${target_os}"
+    printf 'target_arch\t%s\n' "${target_arch}"
+    printf 'sdk_filename\t%s\n' "${sdk_filename}"
+    printf 'frontend_filename\t%s\n' "${frontend_filename}"
+    printf 'stdx_version\t%s\n' "${stdx_version}"
+    printf 'stdx_target\t%s\n' "${stdx_target}"
+    printf 'installed_at\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } > "${release}/.cjman-install.tsv"
+}
+
+function __cjman_marker_value() {
+  local release="$1"
+  local key="$2"
+  [[ -f "${release}/.cjman-install.tsv" ]] || return 1
+  awk -F '\t' -v key="${key}" '
+    $1 == key { value = $2 }
+    END {
+      if (value == "") exit 1
+      print value
+    }
+  ' "${release}/.cjman-install.tsv"
+}
+
+function __cjman_update_stdx_marker() {
+  local release="$1"
+  local stdx_version="$2"
+  local stdx_target="$3"
+  local marker="${release}/.cjman-install.tsv"
+  local partial="${marker}.part.$$"
+  [[ -f "${marker}" ]] || return 1
+  awk -F '\t' '
+    $1 != "stdx_version" && $1 != "stdx_target" { print }
+  ' "${marker}" > "${partial}" || return 1
+  {
+    printf 'stdx_version\t%s\n' "${stdx_version}"
+    printf 'stdx_target\t%s\n' "${stdx_target}"
+  } >> "${partial}" || {
+    command rm -f "${partial}"
+    return 1
+  }
+  command mv "${partial}" "${marker}"
+}
+
+function __cjman_record_nightly() {
+  local version="$1"
+  local host_os="$2"
+  local host_arch="$3"
+  local target_os="$4"
+  local target_arch="$5"
+  local marker partial
+  marker="$(__cjman_nightly_marker "${host_os}" "${host_arch}" "${target_os}" "${target_arch}")"
+  partial="${marker}.part.$$"
+  printf '%s\n' "${version}" > "${partial}" || return 1
+  command mv "${partial}" "${marker}"
+}
+
+function __cjman_print_use_tip() {
+  local version="$1"
+  local target_os="$2"
+  local target_arch="$3"
+  printf 'cangjie %s installed. Activate it with:\n' "${version}"
+  if [[ "${target_os}" == "native" ]]; then
+    printf '  cjman use %s\n' "${version}"
+  else
+    printf '  cjman use %s --target %s --target-arch %s\n' \
+      "${version}" "${target_os}" "${target_arch}"
+  fi
+}
+
+function __cjman_install_transaction() (
+  local requested="$1"
+  local host_os="$2"
+  local host_arch="$3"
+  local target_os="$4"
+  local target_arch="$5"
+  local with_stdx="$6"
+  local allow_legacy="$7"
+  local stable_version=""
+  local version channel manifest sdk_line
+  local sdk_filename sdk_url sdk_sha sdk_format sdk_component_version=""
+  local frontend_line="" frontend_filename="" frontend_url="" frontend_format=""
+  local stdx_line="" stdx_filename="" stdx_url="" stdx_version="" stdx_target
+  local nightly_json="" nightly_assets=""
+  local release lock stage sdk_archive frontend_archive="" stdx_archive=""
+  local envsetup sdk_root list_file current_stdx
+
+  stable_version="$(__cjman_resolve_stable_alias "${requested}" 2>/dev/null || true)"
+  if [[ -n "${stable_version}" ]]; then
+    version="${stable_version}"
+    channel="$(__cjman_fetch_catalog | awk -F '\t' -v v="${version}" 'NR > 1 && $1 == v { print tolower($2); exit }')"
+    manifest="$(__cjman_fetch_manifest "${version}")" || {
+      __cjman_error "failed to load release metadata for ${version}"
+      return 1
+    }
+    local sdk_target_os="${target_os}"
+    [[ "${sdk_target_os}" == "ios-simulator" ]] && sdk_target_os="ios"
+    sdk_line="$(__cjman_select_stable_sdk "${manifest}" "${host_os}" "${host_arch}" \
+      "${sdk_target_os}" "${target_arch}" "default")" || {
+      __cjman_error "no SDK for host ${host_os}-${host_arch}, target ${target_os}-${target_arch}, version ${version}"
+      return 1
+    }
+    IFS=$'\t' read -r _ _ _ _ _ _ sdk_format sdk_filename sdk_url sdk_sha _ <<< "${sdk_line}"
+  else
+    nightly_json="$(__cjman_nightly_release_json "${requested}")" || {
+      __cjman_error "version not found: ${requested}"
+      return 1
+    }
+    version="$(printf '%s' "${nightly_json}" | __cjman_extract_tag_from_json)"
+    [[ -n "${version}" ]] || {
+      __cjman_error "nightly release has no tag"
+      return 1
+    }
+    channel="nightly"
+    nightly_assets="$(__cjman_nightly_assets "${version}" "${nightly_json}")"
+    sdk_line="$(printf '%s\n' "${nightly_assets}" |
+      __cjman_pick_nightly_sdk "${host_os}" "${host_arch}" "${target_os}" "${target_arch}")" || {
+      __cjman_error "no Nightly SDK for host ${host_os}-${host_arch}, target ${target_os}-${target_arch}"
+      return 1
+    }
+    IFS=$'\t' read -r sdk_filename sdk_url sdk_format <<< "${sdk_line}"
+    sdk_sha=""
+    sdk_component_version="$(__cjman_nightly_sdk_version \
+      "${sdk_filename}" "${host_os}" "${host_arch}" "${target_os}" "${target_arch}")" || {
+      __cjman_error "could not determine the build version in ${sdk_filename}"
+      return 1
+    }
+    frontend_line="$(printf '%s\n' "${nightly_assets}" |
+      __cjman_pick_nightly_frontend \
+        "${host_os}" "${host_arch}" "${sdk_component_version}" || true)"
+    if [[ -n "${frontend_line}" ]]; then
+      IFS=$'\t' read -r frontend_filename frontend_url frontend_format <<< "${frontend_line}"
+    else
+      __cjman_warn "this Nightly release has no matching frontend; installing its SDK without the frontend overlay"
+    fi
+  fi
+
+  stdx_target="$(__cjman_stdx_target "${host_os}" "${host_arch}" "${target_os}" "${target_arch}")"
+  if [[ "${with_stdx}" == "1" ]]; then
+    if [[ "${channel}" == "nightly" ]]; then
+      stdx_line="$(printf '%s\n' "${nightly_assets}" |
+        __cjman_pick_nightly_stdx "${stdx_target}" "${sdk_component_version}" || true)"
+    else
+      stdx_line="$(__cjman_find_stdx_asset "${version}" "${stdx_target}" || true)"
+    fi
+    if [[ -n "${stdx_line}" ]]; then
+      IFS=$'\t' read -r stdx_filename stdx_url <<< "${stdx_line}"
+      stdx_version="$(__cjman_stdx_version_from_name "${stdx_filename}" "${stdx_target}")"
+    else
+      __cjman_warn "no compatible stdx asset for ${version} (${stdx_target}); the SDK will still be installed"
+    fi
+  fi
+
+  release="$(__cjman_resolve_install_dir \
+    "${version}" "${host_os}" "${host_arch}" "${target_os}" "${target_arch}" \
+    0 "${allow_legacy}")"
+  if [[ -f "${release}/envsetup.sh" ]]; then
+    if [[ "${channel}" == "nightly" ]]; then
+      __cjman_record_nightly "${version}" "${host_os}" "${host_arch}" \
+        "${target_os}" "${target_arch}" ||
+        __cjman_warn "could not update the current Nightly marker"
+    fi
+    if [[ "${with_stdx}" == "1" && -n "${stdx_filename}" ]]; then
+      current_stdx="$(__cjman_marker_value "${release}" "stdx_version" 2>/dev/null || true)"
+      if [[ ! -d "${release}/stdx" || "${current_stdx}" != "${stdx_version}" ]]; then
+        __cjman_log "updating stdx to ${stdx_version}"
+        __cjman_install_stdx "${version}" \
+          --host-os "${host_os}" \
+          --host-arch "${host_arch}" \
+          --target "${target_os}" \
+          --target-arch "${target_arch}" || return 1
+      fi
+    fi
+    __cjman_print_use_tip "${version}" "${target_os}" "${target_arch}"
+    return 0
+  fi
+  if [[ -e "${release}" ]]; then
+    __cjman_error "incomplete installation already exists: ${release}"
+    return 1
+  fi
+
+  command mkdir -p "${CANGJIE_BUNDLES}" || return 1
+  lock="${release}.lock"
+  if ! __cjman_acquire_lock "${lock}"; then
+    __cjman_error "another install is already using ${release}"
+    return 1
+  fi
+  stage="$(mktemp -d "${CANGJIE_BUNDLES}/.cjman-stage.XXXXXX")" || {
+    __cjman_release_lock "${lock}"
+    return 1
+  }
+  trap 'command rm -rf "${stage}"; __cjman_release_lock "${lock}"' EXIT
+  list_file="${stage}/archive-entries.txt"
+
+  sdk_archive="$(__cjman_download "${sdk_url}" "${sdk_filename}" "${sdk_sha}")" || return 1
+  __cjman_extract_archive "${sdk_archive}" "${sdk_format}" "${stage}" "${list_file}" || {
+    [[ -n "${sdk_sha}" && "${sdk_sha}" != "-" ]] || command rm -f "${sdk_archive}"
+    __cjman_error "${sdk_filename} is not a safe, valid archive"
+    return 1
+  }
+
+  if [[ -n "${frontend_filename}" ]]; then
+    frontend_archive="$(__cjman_download "${frontend_url}" "${frontend_filename}" "")" || return 1
+    __cjman_extract_archive "${frontend_archive}" "${frontend_format}" "${stage}" "${list_file}" || {
+      command rm -f "${frontend_archive}"
+      __cjman_error "${frontend_filename} is not a safe, valid archive"
+      return 1
+    }
+  fi
+
+  envsetup="$(__cjman_find_envsetup "${stage}")"
+  [[ -n "${envsetup}" ]] || {
+    __cjman_error "envsetup.sh not found after extracting ${sdk_filename}"
+    return 1
+  }
+  sdk_root="$(dirname "${envsetup}")"
+
+  if [[ -n "${stdx_filename}" ]]; then
+    stdx_archive="$(__cjman_download "${stdx_url}" "${stdx_filename}" "")" || return 1
+    command mkdir -p "${sdk_root}/stdx" || return 1
+    __cjman_extract_archive "${stdx_archive}" "zip" "${sdk_root}/stdx" "${list_file}" || {
+      command rm -f "${stdx_archive}"
+      __cjman_error "${stdx_filename} is not a safe, valid archive"
+      return 1
+    }
+  fi
+
+  __cjman_write_marker "${sdk_root}" "${version}" "${channel}" "${host_os}" "${host_arch}" \
+    "${target_os}" "${target_arch}" "${sdk_filename}" "${frontend_filename}" \
+    "${stdx_version}" "${stdx_target}" || return 1
+
+  command mv "${sdk_root}" "${release}" || return 1
+  if [[ "${channel}" == "nightly" ]]; then
+    __cjman_record_nightly "${version}" "${host_os}" "${host_arch}" \
+      "${target_os}" "${target_arch}" ||
+      __cjman_warn "could not update the current Nightly marker"
+  fi
+  command rm -rf "${stage}"
+  __cjman_release_lock "${lock}"
+  trap - EXIT
+  __cjman_print_use_tip "${version}" "${target_os}" "${target_arch}"
+)
+
+function __cjman_parse_target_options() {
+  # Output: host_os<TAB>host_arch<TAB>target_os<TAB>target_arch<TAB>with_stdx<TAB>allow_legacy
+  local host_os host_arch
+  local target_os="native"
+  local target_arch=""
+  local with_stdx="1"
+  local allow_legacy="1"
+  if [[ -n "${CJMAN_HOST_OS:-}" || -n "${CJMAN_HOST_ARCH:-}" ]]; then
+    allow_legacy="0"
+  fi
+  host_os="$(__cjman_host_os)" || return 1
+  host_arch="$(__cjman_host_arch)" || return 1
+
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --target)
+        [[ -n "${2:-}" ]] || { __cjman_error "--target requires a value"; return 1; }
+        target_os="$2"
+        shift 2
+        ;;
+      --target-arch)
+        [[ -n "${2:-}" ]] || { __cjman_error "--target-arch requires a value"; return 1; }
+        target_arch="$(__cjman_normalize_arch "$2")" || return 1
+        shift 2
+        ;;
+      --host-arch)
+        [[ -n "${2:-}" ]] || { __cjman_error "--host-arch requires a value"; return 1; }
+        host_arch="$(__cjman_normalize_arch "$2")" || return 1
+        allow_legacy="0"
+        shift 2
+        ;;
+      --host-os)
+        [[ -n "${2:-}" ]] || { __cjman_error "--host-os requires a value"; return 1; }
+        host_os="$(__cjman_normalize_os "$2")" || return 1
+        allow_legacy="0"
+        shift 2
+        ;;
+      --without-stdx)
+        with_stdx="0"
+        shift
+        ;;
+      *)
+        __cjman_error "unknown option: $1"
+        return 1
+        ;;
+    esac
+  done
+
+  case "${target_os}" in
+    native|android|ohos|ios|ios-simulator) ;;
+    *)
+      __cjman_error "unsupported target: ${target_os}"
+      return 1
+      ;;
+  esac
+  if [[ -z "${target_arch}" ]]; then
+    if [[ "${target_os}" == "native" ]]; then
+      target_arch="${host_arch}"
+    else
+      target_arch="aarch64"
+    fi
+  fi
+  if [[ "${target_os}" == "native" && "${target_arch}" != "${host_arch}" ]]; then
+    __cjman_error "native target architecture must match the host architecture (${host_arch})"
+    return 1
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${host_os}" "${host_arch}" "${target_os}" "${target_arch}" \
+    "${with_stdx}" "${allow_legacy}"
+}
+
+function __cjman_install() {
+  local requested="${1:-}"
+  local options
+  local host_os host_arch target_os target_arch with_stdx allow_legacy
+  [[ -n "${requested}" ]] || {
+    __cjman_error "install requires a version"
+    return 1
+  }
+  shift
+  options="$(__cjman_parse_target_options "$@")" || return 1
+  IFS=$'\t' read -r host_os host_arch target_os target_arch with_stdx allow_legacy <<< "${options}"
+  __cjman_install_transaction "${requested}" "${host_os}" "${host_arch}" \
+    "${target_os}" "${target_arch}" "${with_stdx}" "${allow_legacy}"
+}
+
+function __cjman_install_stdx() (
+  local requested="${1:-}"
+  local options host_os host_arch target_os target_arch ignored allow_legacy
+  local stable_version version channel nightly_json nightly_assets
+  local sdk_line sdk_filename sdk_component_version=""
+  local stdx_target stdx_line stdx_filename stdx_url stdx_version
+  local release lock stage archive list_file current_stdx backup=""
+  [[ -n "${requested}" ]] || {
+    __cjman_error "install-stdx requires a version"
+    return 1
+  }
+  shift
+  options="$(__cjman_parse_target_options "$@")" || return 1
+  IFS=$'\t' read -r host_os host_arch target_os target_arch ignored allow_legacy <<< "${options}"
+
+  stable_version="$(__cjman_resolve_stable_alias "${requested}" 2>/dev/null || true)"
+  if [[ -n "${stable_version}" ]]; then
+    version="${stable_version}"
+    channel="$(__cjman_fetch_catalog |
+      awk -F '\t' -v v="${version}" 'NR > 1 && $1 == v { print tolower($2); exit }')"
+    [[ -n "${channel}" ]] || channel="stable"
+  else
+    nightly_json="$(__cjman_nightly_release_json "${requested}")" || {
+      __cjman_error "version not found: ${requested}"
+      return 1
+    }
+    version="$(printf '%s' "${nightly_json}" | __cjman_extract_tag_from_json)"
+    channel="nightly"
+    nightly_assets="$(__cjman_nightly_assets "${version}" "${nightly_json}")"
+    sdk_line="$(printf '%s\n' "${nightly_assets}" |
+      __cjman_pick_nightly_sdk "${host_os}" "${host_arch}" "${target_os}" "${target_arch}")" || {
+      __cjman_error "no Nightly SDK for host ${host_os}-${host_arch}, target ${target_os}-${target_arch}"
+      return 1
+    }
+    IFS=$'\t' read -r sdk_filename _ _ <<< "${sdk_line}"
+    sdk_component_version="$(__cjman_nightly_sdk_version \
+      "${sdk_filename}" "${host_os}" "${host_arch}" "${target_os}" "${target_arch}")" || {
+      __cjman_error "could not determine the build version in ${sdk_filename}"
+      return 1
+    }
+  fi
+
+  release="$(__cjman_resolve_install_dir \
+    "${version}" "${host_os}" "${host_arch}" "${target_os}" "${target_arch}" \
+    0 "${allow_legacy}")"
+  [[ -f "${release}/envsetup.sh" ]] || {
+    __cjman_error "SDK is not installed: ${release}"
+    return 1
+  }
+
+  stdx_target="$(__cjman_stdx_target "${host_os}" "${host_arch}" "${target_os}" "${target_arch}")"
+  if [[ "${channel}" == "nightly" ]]; then
+    stdx_line="$(printf '%s\n' "${nightly_assets}" |
+      __cjman_pick_nightly_stdx "${stdx_target}" "${sdk_component_version}" || true)"
+  else
+    stdx_line="$(__cjman_find_stdx_asset "${version}" "${stdx_target}" || true)"
+  fi
+  [[ -n "${stdx_line}" ]] || {
+    __cjman_error "no compatible stdx asset for ${version} (${stdx_target})"
+    return 1
+  }
+  IFS=$'\t' read -r stdx_filename stdx_url <<< "${stdx_line}"
+  stdx_version="$(__cjman_stdx_version_from_name "${stdx_filename}" "${stdx_target}")"
+  current_stdx="$(__cjman_marker_value "${release}" "stdx_version" 2>/dev/null || true)"
+  if [[ -d "${release}/stdx" && "${current_stdx}" == "${stdx_version}" ]]; then
+    printf 'stdx %s is already installed in %s\n' "${stdx_version}" "${release}/stdx"
+    return 0
+  fi
+
+  lock="${release}.stdx.lock"
+  __cjman_acquire_lock "${lock}" || {
+    __cjman_error "another stdx install is already running"
+    return 1
+  }
+  stage="$(mktemp -d "${CANGJIE_BUNDLES}/.cjman-stdx.XXXXXX")" || {
+    __cjman_release_lock "${lock}"
+    return 1
+  }
+  trap 'command rm -rf "${stage}"; __cjman_release_lock "${lock}"' EXIT
+  command mkdir "${stage}/stdx" || return 1
+  list_file="${stage}/archive-entries.txt"
+  archive="$(__cjman_download "${stdx_url}" "${stdx_filename}" "")" || return 1
+  __cjman_extract_archive "${archive}" "zip" "${stage}/stdx" "${list_file}" || {
+    command rm -f "${archive}"
+    __cjman_error "${stdx_filename} is not a safe, valid archive"
+    return 1
+  }
+
+  if [[ -e "${release}/stdx" ]]; then
+    backup="${release}/.stdx-backup.$$"
+    [[ ! -e "${backup}" ]] || {
+      __cjman_error "stale stdx backup already exists: ${backup}"
+      return 1
+    }
+    command mv "${release}/stdx" "${backup}" || return 1
+  fi
+  if ! command mv "${stage}/stdx" "${release}/stdx"; then
+    [[ -n "${backup}" && -e "${backup}" ]] &&
+      command mv "${backup}" "${release}/stdx"
+    return 1
+  fi
+
+  if [[ -f "${release}/.cjman-install.tsv" ]]; then
+    if ! __cjman_update_stdx_marker "${release}" "${stdx_version}" "${stdx_target}"; then
+      command rm -rf "${release}/stdx"
+      [[ -n "${backup}" && -e "${backup}" ]] &&
+        command mv "${backup}" "${release}/stdx"
+      return 1
+    fi
+  else
+    if ! __cjman_write_marker "${release}" "${version}" "${channel}" \
+        "${host_os}" "${host_arch}" "${target_os}" "${target_arch}" "" "" \
+        "${stdx_version}" "${stdx_target}"; then
+      command rm -rf "${release}/stdx"
+      [[ -n "${backup}" && -e "${backup}" ]] &&
+        command mv "${backup}" "${release}/stdx"
+      return 1
+    fi
+  fi
+  [[ -n "${backup}" && -e "${backup}" ]] && command rm -rf "${backup}"
+  command rm -rf "${stage}"
+  __cjman_release_lock "${lock}"
+  trap - EXIT
+  printf 'stdx %s installed in %s\n' "${stdx_version}" "${release}/stdx"
+)
+
+function __cjman_list_nightly() {
+  local page=1 body tags tag host_os host_arch install_path
+  host_os="$(__cjman_host_os 2>/dev/null || true)"
+  host_arch="$(__cjman_host_arch 2>/dev/null || true)"
+  while [[ "${page}" -le 50 ]]; do
+    body="$(__cjman_fetch_url "${CJMAN_NIGHTLY_API}?per_page=100&page=${page}")" || return 1
+    [[ "${body}" != "[]" ]] || break
+    tags="$(printf '%s' "${body}" | tr -d '\n' |
+      grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' |
+      sed -E 's/^"tag_name"[[:space:]]*:[[:space:]]*"([^"]*)"$/\1/' || true)"
+    [[ -n "${tags}" ]] || break
+    while IFS= read -r tag; do
+      [[ -n "${tag}" ]] || continue
+      install_path="$(__cjman_resolve_install_dir \
+        "${tag}" "${host_os}" "${host_arch}" native "${host_arch}" 1)"
+      if [[ -n "${host_os}" && -n "${host_arch}" &&
+          -f "${install_path}/envsetup.sh" ]]; then
+        printf '%-42s -> Nightly ✔\n' "${tag}"
+      else
+        printf '%-42s -> Nightly\n' "${tag}"
+      fi
+    done <<< "${tags}"
+    page=$((page + 1))
+  done
+}
+
+function __cjman_list() {
+  local include_nightly="0"
+  local catalog version channel name published ignored installed
+  local host_os host_arch install_path
+  [[ "${1:-}" == "--nightly" ]] && include_nightly="1"
+  if [[ -n "${1:-}" && "${1:-}" != "--nightly" ]]; then
+    __cjman_error "unknown list option: $1"
+    return 1
+  fi
+  catalog="$(__cjman_fetch_catalog)" || {
+    __cjman_error "failed to load the release catalog"
+    return 1
+  }
+  host_os="$(__cjman_host_os 2>/dev/null || true)"
+  host_arch="$(__cjman_host_arch 2>/dev/null || true)"
+  printf '%s\n' "${catalog}" |
+    while IFS=$'\t' read -r version channel name published ignored; do
+      [[ "${version}" != "version" && "${version}" != \#* && -n "${version}" ]] || continue
+      installed=""
+      install_path="$(__cjman_resolve_install_dir \
+        "${version}" "${host_os}" "${host_arch}" native "${host_arch}" 1)"
+      [[ -n "${host_os}" && -n "${host_arch}" &&
+          -f "${install_path}/envsetup.sh" ]] && installed="✔"
+      printf '%-22s -> %-4s %-28s %s\n' "${version}" "${channel}" "${name}" "${installed}"
+    done
+  if [[ "${include_nightly}" == "1" ]]; then
+    __cjman_list_nightly
+  else
+    local latest_json latest_tag
+    latest_json="$(__cjman_nightly_release_json nightly 2>/dev/null || true)"
+    latest_tag="$(printf '%s' "${latest_json}" | __cjman_extract_tag_from_json 2>/dev/null || true)"
+    [[ -n "${latest_tag}" ]] &&
+      printf '%-22s -> Nightly (use: cjman install nightly)\n' "${latest_tag}"
+  fi
+}
+
+function __cjman_targets() {
+  local requested="${1:-}"
+  local version manifest stable_version nightly_json tag
+  [[ -n "${requested}" ]] || {
+    __cjman_error "targets requires a version"
+    return 1
+  }
+  stable_version="$(__cjman_resolve_stable_alias "${requested}" 2>/dev/null || true)"
+  if [[ -n "${stable_version}" ]]; then
+    version="${stable_version}"
+    manifest="$(__cjman_fetch_manifest "${version}")" || return 1
+    printf 'SDK targets for %s:\n' "${version}"
+    printf '%s\n' "${manifest}" |
+      awk -F '\t' '
+        NR == 1 || $1 ~ /^#/ || $1 != "sdk" { next }
+        { print "  " $2 "-" $3 " -> " $4 "-" $5 " (" $7 "): " $8 }
+      '
+    printf 'Compatible stdx assets:\n'
+    __cjman_collect_stdx_assets |
+      while IFS=$'\t' read -r name ignored; do
+        case "${name}" in
+          cangjie-stdx-*-"${version}".[0-9]*.zip) printf '  %s\n' "${name}" ;;
+        esac
+      done
+  else
+    nightly_json="$(__cjman_nightly_release_json "${requested}")" || return 1
+    tag="$(printf '%s' "${nightly_json}" | __cjman_extract_tag_from_json)"
+    printf 'Published assets for %s:\n' "${tag}"
+    printf '%s' "${nightly_json}" |
+      __cjman_extract_assets_from_json |
+      while IFS=$'\t' read -r name ignored; do
+        case "${name}" in
+          cangjie-sdk-*|cangjie-frontend-*|cangjie-stdx-*) printf '  %s\n' "${name}" ;;
+        esac
+      done
+  fi
+}
+
+function __cjman_strip_root_from_path() {
+  local value="$1"
+  local root="$2"
+  printf '%s' "${value}" |
+    awk -v RS=: -v root="${root}" '
+      $0 != root && index($0, root "/") != 1 {
+        if (count++) printf ":"
+        printf "%s", $0
+      }
+    '
+}
+
+function __cjman_dedupe_path() {
+  local value="$1"
+  printf '%s' "${value}" |
+    awk -v RS=: '
+      !seen[$0]++ {
+        if (count++) printf ":"
+        printf "%s", $0
+      }
+    '
+}
+
+function __cjman_use() {
+  local requested="${1:-}"
+  local options host_os host_arch target_os target_arch ignored allow_legacy
+  local stable_version version nightly_json release envsetup
+  local old_path old_ld old_dyld old_cangjie_home old_sdkroot
+  local old_active_root old_stdx_root
+  local old_ld_set old_dyld_set old_cangjie_home_set old_sdkroot_set
+  local old_active_root_set old_stdx_root_set source_status
+  local shell_name source_dir script_dir hw_arch
+  [[ -n "${requested}" ]] || {
+    __cjman_error "use requires a version"
+    return 1
+  }
+  shift
+  options="$(__cjman_parse_target_options "$@")" || return 1
+  IFS=$'\t' read -r host_os host_arch target_os target_arch ignored allow_legacy <<< "${options}"
+  stable_version="$(__cjman_resolve_stable_alias "${requested}" 2>/dev/null || true)"
+  if [[ -n "${stable_version}" ]]; then
+    version="${stable_version}"
+  elif [[ "${requested}" == "nightly" ]]; then
+    local latest=""
+    local marker
+    marker="$(__cjman_nightly_marker "${host_os}" "${host_arch}" "${target_os}" "${target_arch}")"
+    if [[ -f "${marker}" ]]; then
+      latest="$(command cat "${marker}")"
+    elif [[ -f "${CANGJIE_BUNDLES}/.nightly-current" ]]; then
+      latest="$(command cat "${CANGJIE_BUNDLES}/.nightly-current")"
+    fi
+    if [[ -n "${latest}" ]]; then
+      version="${latest}"
+    else
+      nightly_json="$(__cjman_nightly_release_json nightly)" || return 1
+      version="$(printf '%s' "${nightly_json}" | __cjman_extract_tag_from_json)"
+    fi
+  else
+    version="${requested}"
+  fi
+
+  release="$(__cjman_resolve_install_dir \
+    "${version}" "${host_os}" "${host_arch}" "${target_os}" "${target_arch}" \
+    0 "${allow_legacy}")"
+  envsetup="${release}/envsetup.sh"
+  [[ -f "${envsetup}" ]] || {
+    __cjman_error "cangjie ${version} is not installed for ${target_os}-${target_arch}"
+    return 1
+  }
+
+  old_path="${PATH}"
+  old_ld="${LD_LIBRARY_PATH-}"
+  old_dyld="${DYLD_LIBRARY_PATH-}"
+  old_cangjie_home="${CANGJIE_HOME-}"
+  old_sdkroot="${SDKROOT-}"
+  old_active_root="${CJMAN_ACTIVE_ROOT-}"
+  old_stdx_root="${CJMAN_STDX_ROOT-}"
+  old_ld_set="${LD_LIBRARY_PATH+x}"
+  old_dyld_set="${DYLD_LIBRARY_PATH+x}"
+  old_cangjie_home_set="${CANGJIE_HOME+x}"
+  old_sdkroot_set="${SDKROOT+x}"
+  old_active_root_set="${CJMAN_ACTIVE_ROOT+x}"
+  old_stdx_root_set="${CJMAN_STDX_ROOT+x}"
+
+  if [[ -n "${CJMAN_ACTIVE_ROOT:-}" ]]; then
+    PATH="$(__cjman_strip_root_from_path "${PATH}" "${CJMAN_ACTIVE_ROOT}")"
+    export PATH
+    if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+      LD_LIBRARY_PATH="$(__cjman_strip_root_from_path "${LD_LIBRARY_PATH}" "${CJMAN_ACTIVE_ROOT}")"
+      export LD_LIBRARY_PATH
+    fi
+    if [[ -n "${DYLD_LIBRARY_PATH:-}" ]]; then
+      DYLD_LIBRARY_PATH="$(__cjman_strip_root_from_path "${DYLD_LIBRARY_PATH}" "${CJMAN_ACTIVE_ROOT}")"
+      export DYLD_LIBRARY_PATH
+    fi
+  fi
+
+  source_status=0
+  source "${envsetup}" || source_status=$?
+  if [[ "${source_status}" -ne 0 ]]; then
+    PATH="${old_path}"
+    export PATH
+    if [[ -n "${old_ld_set}" ]]; then
+      LD_LIBRARY_PATH="${old_ld}"
+      export LD_LIBRARY_PATH
+    else
+      unset LD_LIBRARY_PATH
+    fi
+    if [[ -n "${old_dyld_set}" ]]; then
+      DYLD_LIBRARY_PATH="${old_dyld}"
+      export DYLD_LIBRARY_PATH
+    else
+      unset DYLD_LIBRARY_PATH
+    fi
+    if [[ -n "${old_cangjie_home_set}" ]]; then
+      CANGJIE_HOME="${old_cangjie_home}"
+      export CANGJIE_HOME
+    else
+      unset CANGJIE_HOME
+    fi
+    if [[ -n "${old_sdkroot_set}" ]]; then
+      SDKROOT="${old_sdkroot}"
+      export SDKROOT
+    else
+      unset SDKROOT
+    fi
+    if [[ -n "${old_active_root_set}" ]]; then
+      CJMAN_ACTIVE_ROOT="${old_active_root}"
+      export CJMAN_ACTIVE_ROOT
+    else
+      unset CJMAN_ACTIVE_ROOT
+    fi
+    if [[ -n "${old_stdx_root_set}" ]]; then
+      CJMAN_STDX_ROOT="${old_stdx_root}"
+      export CJMAN_STDX_ROOT
+    else
+      unset CJMAN_STDX_ROOT
+    fi
+    __cjman_error "failed to activate cangjie ${version}; the previous environment was restored"
+    return "${source_status}"
+  fi
+
+  PATH="$(__cjman_dedupe_path "${PATH}")"
+  export PATH
+  if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    LD_LIBRARY_PATH="$(__cjman_dedupe_path "${LD_LIBRARY_PATH}")"
+    export LD_LIBRARY_PATH
+  fi
+  if [[ -n "${DYLD_LIBRARY_PATH:-}" ]]; then
+    DYLD_LIBRARY_PATH="$(__cjman_dedupe_path "${DYLD_LIBRARY_PATH}")"
+    export DYLD_LIBRARY_PATH
+  fi
+  export CJMAN_ACTIVE_ROOT="${CANGJIE_HOME:-${release}}"
+  if [[ -d "${release}/stdx" ]]; then
+    export CJMAN_STDX_ROOT="${release}/stdx"
+  else
+    unset CJMAN_STDX_ROOT
+  fi
+  printf 'cangjie %s activated (%s-%s -> %s-%s).\n' \
+    "${version}" "${host_os}" "${host_arch}" "${target_os}" "${target_arch}"
+}
+
+function __cjman_update() {
+  [[ -d "${CJMAN_HOME}/.git" ]] || {
+    __cjman_error "${CJMAN_HOME} is not a git checkout"
+    return 1
+  }
+  __cjman_log "updating cjman"
+  (
+    cd "${CJMAN_HOME}" &&
+      git pull --ff-only origin master
+  ) || return 1
+  source "${CJMAN_HOME}/cjman"
+}
+
+function __cjman_usage() {
+  printf '%s\n' \
+    "Usage: cjman <command> [options]" \
+    "" \
+    "Commands:" \
+    "  list [--nightly]       List LTS/STS releases; include every Nightly with --nightly" \
+    "  targets <version>      List every published SDK/frontend/stdx asset" \
+    "  install <version>      Install SDK and the newest compatible stdx" \
+    "  install-stdx <version> Add stdx to an existing SDK installation" \
+    "  use <version>          Activate an installed SDK in the current shell" \
+    "  update                 Update cjman" \
+    "" \
+    "Version aliases: latest, lts, sts, nightly" \
+    "" \
+    "Install/use options:" \
+    "  --target <name>        native (default), android, ohos, ios, ios-simulator" \
+    "  --target-arch <arch>   x64, aarch64, arm32 (cross-target default: aarch64)" \
+    "  --host-arch <arch>     Override detected host architecture" \
+    "  --without-stdx         Install only the SDK" \
+    "" \
+    "Examples:" \
+    "  cjman install lts" \
+    "  cjman install 1.1.3 --target ohos --target-arch x64" \
+    "  cjman install nightly --target android --target-arch arm32"
 }
 
 function cjman() {
-  if [[ "$1" == "list" ]]; then
-    list
-    return $?
-  fi
-
-  if [[ "$1" == "install" ]]; then
-    shift
-    install "$@"
-    return $?
-  fi
-
-  if [[ "$1" == "use" ]]; then
-    shift
-    use "$@"
-    return $?
-  fi
-
-  if [[ "$1" == "update" ]]; then
-    update
-    return $?
-  fi
-
-  usage
-  return 0
+  local command="${1:-}"
+  [[ "$#" -gt 0 ]] && shift
+  case "${command}" in
+    list) __cjman_list "$@" ;;
+    targets) __cjman_targets "$@" ;;
+    install) __cjman_install "$@" ;;
+    install-stdx) __cjman_install_stdx "$@" ;;
+    use) __cjman_use "$@" ;;
+    update) __cjman_update "$@" ;;
+    help|-h|--help|'') __cjman_usage ;;
+    *)
+      __cjman_error "unknown command: ${command}"
+      __cjman_usage
+      return 1
+      ;;
+  esac
 }

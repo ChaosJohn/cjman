@@ -1,0 +1,7 @@
+*.tsv text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.sh text eol=lf
+cjman text eol=lf
+cjman-installer text eol=lf
+common text eol=lf

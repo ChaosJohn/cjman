@@ -1,0 +1,2 @@
+component	host_os	host_arch	target_os	target_arch	flavor	format	filename	url	sha256	size
+sdk	linux	x64	native	x64	default	tar.gz	cangjie-sdk-linux-x64-1.0.1.tar.gz	https://example.invalid/cangjie-sdk-linux-x64-1.0.1.tar.gz	4444444444444444444444444444444444444444444444444444444444444444	296.4MB
