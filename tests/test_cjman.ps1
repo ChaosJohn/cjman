@@ -347,6 +347,8 @@ Invoke-Test 'activation removes old SDK paths and rolls back on failure' {
     ) | Set-Content -LiteralPath $setupPath -Encoding UTF8
 
     $oldBin = Join-Path $oldRoot 'bin'
+    $savedPath = $env:PATH
+    $savedActiveRoot = $env:CJMAN_ACTIVE_ROOT
     $env:PATH = "$oldBin$separator/usr/bin"
     $env:CJMAN_ACTIVE_ROOT = $oldRoot
     Enable-CjmanEnvironment `
@@ -380,6 +382,8 @@ Invoke-Test 'activation removes old SDK paths and rolls back on failure' {
     Assert-Equal $pathBeforeFailure $env:PATH 'failed activation did not restore PATH'
     Assert-Equal $newRoot $env:CJMAN_ACTIVE_ROOT `
         'failed activation did not restore CJMAN_ACTIVE_ROOT'
+    $env:PATH = $savedPath
+    $env:CJMAN_ACTIVE_ROOT = $savedActiveRoot
 }
 
 Invoke-Test 'PowerShell home defaults to the checkout containing cjman.ps1' {
