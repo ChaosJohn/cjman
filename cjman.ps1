@@ -1355,14 +1355,16 @@ function Save-CjmanAsset {
             -UseBasicParsing `
             -ErrorAction Stop
 
-        if (-not (Test-CjmanFileHash -Path $partPath -ExpectedSha256 $Asset.Sha256)) {
+        Move-Item -LiteralPath $partPath -Destination $destination -Force -ErrorAction Stop
+
+        if (-not (Test-CjmanFileHash -Path $destination -ExpectedSha256 $Asset.Sha256)) {
             throw "SHA-256 or ZIP validation failed for '$($Asset.Filename)'."
         }
 
-        Move-Item -LiteralPath $partPath -Destination $destination -Force -ErrorAction Stop
         return $destination
     } catch {
         Remove-Item -LiteralPath $partPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
         throw
     } finally {
         $ProgressPreference = $oldProgressPreference
