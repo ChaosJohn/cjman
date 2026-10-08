@@ -1,33 +1,79 @@
-function error() {
-  tput sgr0
-  tput setaf 1
-  echo "ERR: $1"
-  tput sgr0
+#!/usr/bin/env bash
+
+set -u
+
+function cjman_installer_error() {
+  printf 'ERR: %s\n' "$*" >&2
   exit 1
 }
 
-GIT_PROVIDER=${GIT_PROVIDER:-github.com}
+command -v git >/dev/null 2>&1 ||
+  cjman_installer_error "git is required"
+command -v mktemp >/dev/null 2>&1 ||
+  cjman_installer_error "mktemp is required"
+
+GIT_PROVIDER="${GIT_PROVIDER:-gitcode.com}"
 GIT_URL="https://${GIT_PROVIDER}/ChaosJohn/cjman.git"
+CJMAN_HOME="${CJMAN_HOME:-${HOME}/.cjman}"
 
-CJMAN_HOME="${HOME}/.cjman"
-[[ -d ${CJMAN_HOME} ]] && error "cjman already exists"
-mkdir -p ${CJMAN_HOME}
+case "${CJMAN_HOME}" in
+  ''|/|.|"${HOME}"|"${HOME}/")
+    cjman_installer_error "refusing unsafe CJMAN_HOME: ${CJMAN_HOME}"
+    ;;
+esac
+[[ ! -e "${CJMAN_HOME}" ]] ||
+  cjman_installer_error "cjman already exists: ${CJMAN_HOME}"
 
-which git > /dev/null
-[[ ! $? -eq 0 ]] && error "git not found"
-git clone --quiet ${GIT_URL} ${CJMAN_HOME} 
-if [[ ! $? -eq 0 ]]; then
-  rm -rf ${CJMAN_HOME}
-  error "failed to clone ${GIT_URL}"
+CJMAN_PARENT="$(dirname "${CJMAN_HOME}")"
+mkdir -p "${CJMAN_PARENT}" ||
+  cjman_installer_error "cannot create ${CJMAN_PARENT}"
+CJMAN_STAGE="$(mktemp -d "${CJMAN_PARENT}/.cjman-install.XXXXXX")" ||
+  cjman_installer_error "cannot create an installation staging directory"
+
+function cjman_installer_cleanup() {
+  rm -rf "${CJMAN_STAGE}"
+}
+trap cjman_installer_cleanup EXIT
+
+git clone --quiet "${GIT_URL}" "${CJMAN_STAGE}/repo" ||
+  cjman_installer_error "failed to clone ${GIT_URL}"
+mv "${CJMAN_STAGE}/repo" "${CJMAN_HOME}" ||
+  cjman_installer_error "failed to install cjman in ${CJMAN_HOME}"
+
+if [[ -n "${CJMAN_PROFILE_FILE:-}" ]]; then
+  CJMAN_PROFILE="${CJMAN_PROFILE_FILE}"
+else
+  case "${SHELL:-}" in
+    */zsh)
+      CJMAN_PROFILE="${HOME}/.zshrc"
+      ;;
+    *)
+      case "$(uname -s)" in
+        Darwin*|MINGW*|MSYS*|CYGWIN*) CJMAN_PROFILE="${HOME}/.bash_profile" ;;
+        *) CJMAN_PROFILE="${HOME}/.bashrc" ;;
+      esac
+      ;;
+  esac
 fi
 
-SOURCE_FILE="${CJMAN_HOME}/cjman"
-SOURCE_LINE="[[ -s ${SOURCE_FILE} ]] && source ${SOURCE_FILE}"
-PROFILE="${HOME}/.bashrc"
-echo $SHELL | grep -qw "zsh" && PROFILE="${HOME}/.zshrc"
-grep -qF "^${SOURCE_LINE}" ${PROFILE} || echo "${SOURCE_LINE}" >> ${PROFILE}
+touch "${CJMAN_PROFILE}" ||
+  cjman_installer_error "cannot update ${CJMAN_PROFILE}"
+CJMAN_HOME_SHELL="$(printf '%q' "${CJMAN_HOME}")"
+CJMAN_HOME_LINE="export CJMAN_HOME=${CJMAN_HOME_SHELL}"
+CJMAN_SOURCE_LINE='[[ -s "${CJMAN_HOME}/cjman" ]] && source "${CJMAN_HOME}/cjman"'
 
-echo "cjman installed successfully"
-echo 
-echo "Please open a new terminal session or try in current session:"
-echo " \`source ${SOURCE_FILE}\`"
+if ! grep -qxF "${CJMAN_SOURCE_LINE}" "${CJMAN_PROFILE}"; then
+  {
+    printf '\n# cjman\n'
+    printf '%s\n' "${CJMAN_HOME_LINE}"
+    printf '%s\n' "${CJMAN_SOURCE_LINE}"
+  } >> "${CJMAN_PROFILE}"
+fi
+
+trap - EXIT
+rm -rf "${CJMAN_STAGE}"
+
+printf 'cjman installed successfully in %s\n' "${CJMAN_HOME}"
+printf 'Profile updated: %s\n' "${CJMAN_PROFILE}"
+printf 'Open a new terminal, or run:\n'
+printf '  source %q\n' "${CJMAN_HOME}/cjman"

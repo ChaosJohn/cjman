@@ -1,16 +1,48 @@
-# export CJMAN_HOME="${HOME}/.cjman"
+# Shared configuration and namespaced helpers for cjman.
 
-export BASE_URL="https://raw.gitcode.com/ChaosJohn/cjman/raw/master"
-if grep -qF "github.com" "${CJMAN_HOME}/.git/config"; then
-  export BASE_URL="https://raw.githubusercontent.com/ChaosJohn/cjman/master"
+export CJMAN_HOME="${CJMAN_HOME:-${HOME}/.cjman}"
+export CANGJIE_BUNDLES="${CANGJIE_BUNDLES:-${CJMAN_HOME}/bundles}"
+
+if [[ -z "${BASE_URL:-}" ]]; then
+  if [[ -f "${CJMAN_HOME}/.git/config" ]] &&
+      grep -qF "github.com" "${CJMAN_HOME}/.git/config"; then
+    BASE_URL="https://raw.githubusercontent.com/ChaosJohn/cjman/master"
+  else
+    BASE_URL="https://raw.gitcode.com/ChaosJohn/cjman/raw/master"
+  fi
 fi
+export BASE_URL
 
-export VERSIONS_URL="${BASE_URL}/versions.txt"
+export VERSIONS_URL="${VERSIONS_URL:-${BASE_URL}/versions.txt}"
+export CJMAN_METADATA_BASE="${CJMAN_METADATA_BASE:-${BASE_URL}/metadata/v2}"
+export CJMAN_NIGHTLY_API="${CJMAN_NIGHTLY_API:-https://api.gitcode.com/api/v5/repos/Cangjie/nightly_build/releases}"
+export CJMAN_STDX_API="${CJMAN_STDX_API:-https://api.gitcode.com/api/v5/repos/Cangjie/cangjie_stdx/releases}"
 
-function error() {
-  tput sgr0
-  tput setaf 1
-  echo "ERR: $1"
-  tput sgr0
-  # exit 1
+function __cjman_color() {
+  local color="$1"
+  if command -v tput >/dev/null 2>&1 && [[ -t 2 ]]; then
+    tput setaf "${color}" 2>/dev/null || true
+  fi
+}
+
+function __cjman_reset_color() {
+  if command -v tput >/dev/null 2>&1 && [[ -t 2 ]]; then
+    tput sgr0 2>/dev/null || true
+  fi
+}
+
+function __cjman_error() {
+  __cjman_color 1
+  printf 'ERR: %s\n' "$*" >&2
+  __cjman_reset_color
+}
+
+function __cjman_warn() {
+  __cjman_color 3
+  printf 'WARN: %s\n' "$*" >&2
+  __cjman_reset_color
+}
+
+function __cjman_log() {
+  printf '[cjman] %s\n' "$*" >&2
 }
